@@ -56,7 +56,10 @@ export class AudioStreamer {
         // Note: stopping already scheduled sources is complex without tracking them, 
         // but for 'Stop' button we usually tear down the context or disconnect.
         this.gainNode.disconnect();
-        this.gainNode = this.audioContext.createGain();
-        this.gainNode.connect(this.audioContext.destination);
+        // Only recreate if context is active, otherwise it throws
+        if (this.audioContext.state !== 'closed') {
+            this.gainNode = this.audioContext.createGain();
+            this.gainNode.connect(this.audioContext.destination);
+        }
     }
 }

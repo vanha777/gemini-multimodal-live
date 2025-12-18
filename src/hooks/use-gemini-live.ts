@@ -3,24 +3,33 @@ import { AudioStreamer } from '../utils/audio-streamer';
 
 export type LiveStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
-export function useGeminiLive({ apiKey }: { apiKey: string }) {
+export type Message = {
+    role: 'user' | 'model' | 'system';
+    text: string;
+};
+
+export function useGeminiLive({ apiKey, systemInstruction }: { apiKey: string, systemInstruction?: string }) {
     const [status, setStatus] = useState<LiveStatus>('disconnected');
     const [isRecording, setIsRecording] = useState(false);
     const [videoStream, setVideoStream] = useState<MediaStream | null>(null);
     const [volumeLevel, setVolumeLevel] = useState({ user: 0, ai: 0 });
+    const [messages, setMessages] = useState<Message[]>([]);
 
-    // Refs for persistence without re-renders
+    // Refs
     const wsRef = useRef<WebSocket | null>(null);
     const audioContextRef = useRef<AudioContext | null>(null);
-    const mediaStreamRef = useRef<MediaStream | null>(null);
+    const mediaStreamRef = useRef<MediaStream | null>(null); // Screen Share
+    const audioStreamRef = useRef<MediaStream | null>(null); // Mic
     const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
     const audioStreamerRef = useRef<AudioStreamer | null>(null);
-    const videoIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-    // Volumne Analysis Refs
+    // Intervals
+    const videoIntervalRef = useRef<NodeJS.Timeout | null>(null);
+    const analysisIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+    // Analysers
     const userAnalyserRef = useRef<AnalyserNode | null>(null);
     const aiAnalyserRef = useRef<AnalyserNode | null>(null);
-    const animationFrameRef = useRef<number | null>(null);
 
     const connect = useCallback(async () => {
         if (!apiKey) {
@@ -38,7 +47,6 @@ export function useGeminiLive({ apiKey }: { apiKey: string }) {
             await audioContext.resume();
             audioContextRef.current = audioContext;
 
-            // Setup Analysers
             const userAnalyser = audioContext.createAnalyser();
             userAnalyser.fftSize = 256;
             userAnalyserRef.current = userAnalyser;
@@ -47,12 +55,7 @@ export function useGeminiLive({ apiKey }: { apiKey: string }) {
             aiAnalyser.fftSize = 256;
             aiAnalyserRef.current = aiAnalyser;
 
-            // Setup Streamer (connects to AI analyser)
             const streamer = new AudioStreamer(audioContext);
-            // We need to tap into the streamer's source to feed the analyser
-            // *Note*: AudioStreamer implementation needs a way to expose its gain node or connect it.
-            // For now, we'll assume we can pass the analyser to the streamer or modify the streamer.
-            // Let's modify the Streamer to connect to analyser before destination.
             streamer.connectToAnalyser(aiAnalyser);
             audioStreamerRef.current = streamer;
 
@@ -69,7 +72,10 @@ export function useGeminiLive({ apiKey }: { apiKey: string }) {
                         model: "models/gemini-2.0-flash-exp",
                         generation_config: {
                             response_modalities: ["AUDIO"]
-                        }
+                        },
+                        system_instruction: systemInstruction ? {
+                            parts: [{ text: systemInstruction }]
+                        } : undefined
                     }
                 };
                 ws.send(JSON.stringify(setupMsg));
@@ -88,54 +94,76 @@ export function useGeminiLive({ apiKey }: { apiKey: string }) {
                             }
                             streamer.addPCM16(bytes);
                         }
+                        if (part.text) {
+                            console.log("Received text:", part.text);
+                            setMessages(prev => [...prev, { role: 'model', text: part.text }]);
+                        }
                     }
                 }
             };
 
-            ws.onclose = () => {
-                console.log("WebSocket Disconnected");
+            ws.onclose = (event) => {
+                console.log("WebSocket Disconnected", event.code, event.reason);
                 setStatus('disconnected');
-                stopAnalysisLoop();
+                cleanup();
             };
 
             ws.onerror = (err) => {
                 console.error("WebSocket Error", err);
                 setStatus('error');
-                stopAnalysisLoop();
+                cleanup();
             };
 
             wsRef.current = ws;
 
-            // 3. Start Media Capture (Audio + Video)
             await startMedia(audioContext, ws, userAnalyser);
 
         } catch (error) {
             console.error("Connection Failed", error);
             setStatus('error');
         }
-    }, [apiKey]);
+    }, [apiKey, systemInstruction]);
 
     const startMedia = async (context: AudioContext, ws: WebSocket, userAnalyser: AnalyserNode) => {
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({
+            const audioStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     channelCount: 1,
                     sampleRate: 16000,
-                },
-                video: {
-                    width: { ideal: 640 },
-                    height: { ideal: 480 },
-                    frameRate: { ideal: 15 } // Lower framerate for streaming efficiency
                 }
             });
-            mediaStreamRef.current = stream;
-            setVideoStream(stream);
+            // Safety check with cast
+            if ((context.state as string) === 'closed') {
+                audioStream.getTracks().forEach(t => t.stop());
+                return;
+            }
+            audioStreamRef.current = audioStream;
 
-            // Audio Chain: Source -> Analyser -> Worklet
-            const source = context.createMediaStreamSource(stream);
-            source.connect(userAnalyser); // Connect for visualizer
+            const screenStream = await navigator.mediaDevices.getDisplayMedia({
+                video: {
+                    width: { ideal: 1280, max: 1920 },
+                    height: { ideal: 720, max: 1080 },
+                    frameRate: { ideal: 10, max: 15 }
+                },
+                audio: false
+            });
+            // Safety check with cast
+            if ((context.state as string) === 'closed') {
+                audioStream.getTracks().forEach(t => t.stop());
+                screenStream.getTracks().forEach(t => t.stop());
+                return;
+            }
+            mediaStreamRef.current = screenStream;
+            setVideoStream(screenStream);
+
+            const source = context.createMediaStreamSource(audioStream);
+            source.connect(userAnalyser);
 
             await context.audioWorklet.addModule('/worklets/pcm-processor.js');
+
+            // Safety check before creating worklet with cast
+            if ((context.state as string) === 'closed') return;
+
             const worklet = new AudioWorkletNode(context, 'pcm-processor');
 
             worklet.port.onmessage = (event) => {
@@ -150,21 +178,20 @@ export function useGeminiLive({ apiKey }: { apiKey: string }) {
                 }
             };
 
-            userAnalyser.connect(worklet); // Pass through analyser to worklet
+            userAnalyser.connect(worklet);
             audioWorkletNodeRef.current = worklet;
             setIsRecording(true);
 
-            // Start Video Frame Transmission Loop
-            startVideoTransmission(ws, stream);
+            startVideoTransmission(ws, screenStream);
 
         } catch (err) {
             console.error("Error starting media", err);
+            cleanup();
         }
     };
 
     const startVideoTransmission = (ws: WebSocket, stream: MediaStream) => {
         const videoTrack = stream.getVideoTracks()[0];
-        const imageCapture = new (window as any).ImageCapture(videoTrack);
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d');
         const video = document.createElement('video');
@@ -172,12 +199,16 @@ export function useGeminiLive({ apiKey }: { apiKey: string }) {
         video.muted = true;
         video.play();
 
-        const frameInterval = 200; // 5 FPS
+        videoTrack.onended = () => {
+            cleanup();
+        };
 
-        videoIntervalRef.current = setInterval(async () => {
+        if (videoIntervalRef.current) clearInterval(videoIntervalRef.current);
+
+        videoIntervalRef.current = setInterval(() => {
             if (ws.readyState === WebSocket.OPEN && video.readyState === video.HAVE_ENOUGH_DATA) {
-                canvas.width = video.videoWidth * 0.5; // Scale down for bandwidth
-                canvas.height = video.videoHeight * 0.5;
+                canvas.width = 640;
+                canvas.height = 360;
                 ctx?.drawImage(video, 0, 0, canvas.width, canvas.height);
 
                 const base64 = canvas.toDataURL('image/jpeg', 0.6).split(',')[1];
@@ -188,11 +219,13 @@ export function useGeminiLive({ apiKey }: { apiKey: string }) {
                 };
                 ws.send(JSON.stringify(msg));
             }
-        }, frameInterval);
+        }, 200);
     };
 
     const startAnalysisLoop = () => {
-        const loop = () => {
+        if (analysisIntervalRef.current) clearInterval(analysisIntervalRef.current);
+
+        analysisIntervalRef.current = setInterval(() => {
             if (userAnalyserRef.current && aiAnalyserRef.current) {
                 const userBuffer = new Uint8Array(userAnalyserRef.current.frequencyBinCount);
                 const aiBuffer = new Uint8Array(aiAnalyserRef.current.frequencyBinCount);
@@ -205,16 +238,10 @@ export function useGeminiLive({ apiKey }: { apiKey: string }) {
 
                 setVolumeLevel({ user: userAvg, ai: aiAvg });
             }
-            animationFrameRef.current = requestAnimationFrame(loop);
-        };
-        loop();
+        }, 100);
     };
 
-    const stopAnalysisLoop = () => {
-        if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-    };
-
-    const disconnect = useCallback(() => {
+    const cleanup = useCallback(() => {
         if (wsRef.current) {
             wsRef.current.close();
             wsRef.current = null;
@@ -222,11 +249,20 @@ export function useGeminiLive({ apiKey }: { apiKey: string }) {
         if (mediaStreamRef.current) {
             mediaStreamRef.current.getTracks().forEach(track => track.stop());
             mediaStreamRef.current = null;
-            setVideoStream(null);
+        }
+        setVideoStream(null);
+
+        if (audioStreamRef.current) {
+            audioStreamRef.current.getTracks().forEach(track => track.stop());
+            audioStreamRef.current = null;
         }
         if (videoIntervalRef.current) {
             clearInterval(videoIntervalRef.current);
             videoIntervalRef.current = null;
+        }
+        if (analysisIntervalRef.current) {
+            clearInterval(analysisIntervalRef.current);
+            analysisIntervalRef.current = null;
         }
         if (audioWorkletNodeRef.current) {
             audioWorkletNodeRef.current.disconnect();
@@ -242,8 +278,11 @@ export function useGeminiLive({ apiKey }: { apiKey: string }) {
         }
         setStatus('disconnected');
         setIsRecording(false);
-        stopAnalysisLoop();
     }, []);
 
-    return { connect, disconnect, status, isRecording, videoStream, volumeLevel };
+    const disconnect = useCallback(() => {
+        cleanup();
+    }, [cleanup]);
+
+    return { connect, disconnect, status, isRecording, videoStream, volumeLevel, messages };
 }
